@@ -1,3 +1,6 @@
+/*
+Package proxy includes common support for all kinds of proxies, including local and remote.
+*/
 package proxy
 
 import (

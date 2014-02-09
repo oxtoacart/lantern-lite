@@ -1,9 +1,14 @@
+/*
+Package proxy includes a local proxy that proxies traffic from the user's browser
+to a remote Lantern proxy.
+*/
 package proxy
 
 import (
 	"../s3config"
 	"crypto/rand"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"fmt"
 	"log"
@@ -13,25 +18,29 @@ import (
 	"time"
 )
 
+/*
+Fallback encapsulates the configuration for a fallback proxy along with the tls configuration used to communicate with it.
+*/
+type Fallback struct {
+	s3config.FallbackConfig
+	tlsConfig *tls.Config
+}
+
 var (
-	tlsConfig   *tls.Config
-	enc         = base64.StdEncoding
-	fallbacks   []s3config.FallbackConfig
-	configMutex sync.Mutex
+	enc            = base64.StdEncoding // Used for Base64 encoding stuff
+	fallbacks      []Fallback           // All configured fallbacks
+	fallbacksMutex sync.Mutex           // Used to synchronize access to fallbacks
 )
 
 const (
-	// 	authToken = "bCRAGxT2mzYVUhb6IAc2iWaXFMq8WFu0SnzhzoTfMTfUniNavV5dx3svHqxiNm83"
-	//authToken              = "forrest_gump"
 	x_lantern_auth_token   = "X-LANTERN-AUTH-TOKEN"
 	x_random_length_header = "X_LANTERN-RANDOM-LENGTH-HEADER"
 )
 
+/*
+StartLocal() starts the local proxy server.
+*/
 func StartLocal() (finished chan bool) {
-	tlsConfig = &tls.Config{
-		InsecureSkipVerify: true, // TODO: disable this to get security back
-	}
-
 	log.Println("Fetching fallback configuration from S3")
 	doUpdateFallbacks()
 	// Start continually fetching fallback information
@@ -43,22 +52,45 @@ func StartLocal() (finished chan bool) {
 	return
 }
 
+/*
+updateFallbacks() keeps updating the fallbacks list as new configuration information becomes available.
+*/
 func updateFallbacks() {
 	for {
 		doUpdateFallbacks()
 	}
 }
 
+/*
+doUpdateFallbacks waits for a new configuration from s3config and then updates the fallbacks list.
+*/
 func doUpdateFallbacks() {
 	config := <-s3config.ConfigUpdate
-	configMutex.Lock()
-	defer configMutex.Unlock()
-	fallbacks = config.Fallbacks
+	fallbacksMutex.Lock()
+	defer fallbacksMutex.Unlock()
+	fallbacks = make([]Fallback, len(config.Fallbacks))
+	for i, fallbackConfig := range config.Fallbacks {
+		tlsConfig := &tls.Config{
+			RootCAs: x509.NewCertPool(),
+			// I have to do this because our current fallback certificates don't contain IP SANs, see https://github.com/getlantern/lantern/issues/1373
+			InsecureSkipVerify: true,
+		}
+		tlsConfig.RootCAs.AddCert(fallbackConfig.X509Cert)
+		fallbacks[i] = Fallback{
+			FallbackConfig: *fallbackConfig,
+			tlsConfig:      tlsConfig,
+		}
+	}
 }
 
-func getFallback() (config s3config.FallbackConfig) {
-	configMutex.Lock()
-	defer configMutex.Unlock()
+/*
+getFallback() gets the first fallback from the fallbacks list
+
+TODO: cycle through fallbacks when multiple are available.
+*/
+func getFallback() (fallback Fallback) {
+	fallbacksMutex.Lock()
+	defer fallbacksMutex.Unlock()
 	if len(fallbacks) == 0 {
 		log.Fatalf("No fallback configured!")
 	} else {
@@ -67,9 +99,12 @@ func getFallback() (config s3config.FallbackConfig) {
 	return
 }
 
+/*
+runLocal rnus the http server for the local proxy.
+*/
 func runLocal(finished chan bool) {
 	server := &http.Server{
-		Addr:         ":8080",
+		Addr:         "127.0.0.1:8080",
 		Handler:      http.HandlerFunc(handleLocalRequest),
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
@@ -82,12 +117,14 @@ func runLocal(finished chan bool) {
 	finished <- true
 }
 
+/*
+handleLocalRequest handles local requests (e.g. from web browser) and dispatches them to a remote fallback.
+*/
 func handleLocalRequest(resp http.ResponseWriter, req *http.Request) {
 	fallback := getFallback()
-	upstreamProxy := fallback.Ip + ":" + fallback.Port
-	//upstreamProxy := "192.168.1.101:62443"
+	upstreamAddr := fallback.Ip + ":" + fallback.Port
 
-	if connOut, err := tls.Dial("tcp", upstreamProxy, tlsConfig); err != nil {
+	if connOut, err := tls.Dial("tcp", upstreamAddr, fallback.tlsConfig); err != nil {
 		msg := fmt.Sprintf("Unable to open socket to upstream proxy: %s", err)
 		respondBadGateway(resp, req, msg)
 	} else {
@@ -99,15 +136,20 @@ func handleLocalRequest(resp http.ResponseWriter, req *http.Request) {
 				msg := fmt.Sprintf("Unable to generate random length header: %s", err)
 				respondBadGateway(resp, req, msg)
 			} else {
+				// Send the initial request on to the downstream proxy
 				req.Header.Set(x_random_length_header, str)
 				req.Header.Set(x_lantern_auth_token, fallback.AuthToken)
 				req.WriteProxy(connOut)
+				// Then pipe the connection
 				pipe(connIn, connOut)
 			}
 		}
 	}
 }
 
+/*
+randomLengthString generates a random length string up to a little over 100 characters in length.
+*/
 func randomLengthString() (str string, err error) {
 	var bLength *big.Int
 	if bLength, err = rand.Int(rand.Reader, big.NewInt(100)); err != nil {
