@@ -1,5 +1,5 @@
 /*
-This is a slimmed down Lantern that fetches its fallback information from the usual S3 mechanism
+lantern-lite is a slimmed down Lantern that fetches its fallback information from the usual S3 mechanism
 and then proxies traffic for you on port 8080.
 */
 package main
@@ -19,12 +19,12 @@ func main() {
 	if intfs, err := netutil.ListInterfaces(); err != nil {
 		log.Fatalf("Unable to list network interfaces: %s", err)
 	} else {
-		log.Println("Setting lantern as your proxy")
+		log.Println("Setting lantern-lite as your proxy")
 		if err := intfs.EnableHTTPProxy("127.0.0.1:8080"); err != nil {
-			log.Fatalf("Unable to set lantern as your proxy: %s", err)
+			log.Fatalf("Unable to set lantern-lite as your proxy: %s", err)
 		} else {
 			onShutdown(func() {
-				log.Println("Unsetting lantern as your proxy")
+				log.Println("Unsetting lantern-lite as your proxy")
 				intfs.DisableHTTPProxy()
 			})
 			<-proxy.StartLocal()
